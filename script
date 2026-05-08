@@ -1,0 +1,775 @@
+"""Self-contained neural Pancake Sorting heuristic with CayleyPy beam search.
+
+This module contains Pancake primitives, dataset creation, neighbor-attention
+value models, CayleyPy predictor integration, teacher training, student
+teacher-distillation, student RL beam-rollout fine-tuning, evaluation, and
+notebook helpers.
+
+Design summary
+--------------
+* Teacher model: permutation + optional GAP feature -> scalar distance/value.
+  GAP is only an input feature; it is never predicted and has no auxiliary loss.
+* Student model: permutation only -> scalar distance/value. It has the same
+  architecture as the teacher except the GAP scalar is not concatenated.
+* Distillation: frozen teacher produces soft scalar targets for the student.
+  Student never receives GAP.
+* RL fine-tuning and beam-search inference: only the student neural heuristic is
+  used. The GAP heuristic is available only as an external evaluation baseline
+  through ``Predictor(graph, "gap")``.
+"""
+
+from __future__ import annotations
+
+import time
+from collections import OrderedDict, deque
+from dataclasses import asdict, dataclass
+from pathlib import Path
+from typing import Any, Iterable
+
+import torch
+import torch.nn.functional as F
+from torch import nn
+from torch.utils.data import DataLoader, Dataset
+from tqdm import tqdm
+
+import cayleypy as cp
+from cayleypy.predictor import Predictor
+
+
+@dataclass(frozen=True)
+class PancakeSpec:
+    """Basic Pancake Sorting specification."""
+
+    n: int
+
+    @property
+    def goal(self) -> torch.Tensor:
+        return torch.arange(1, self.n + 1, dtype=torch.long)
+
+    @property
+    def flips(self) -> list[int]:
+        return list(range(2, self.n + 1))
+
+
+def normalize_permutations(states: torch.Tensor, n: int | None = None) -> torch.Tensor:
+    """Return batched 1-indexed permutation tensors clamped to ``[1, n]``."""
+
+    x = torch.as_tensor(states, dtype=torch.long)
+    if x.dim() == 1:
+        x = x.unsqueeze(0)
+    if n is None:
+        n = x.shape[-1]
+    if x.numel() and int(x.min().item()) == 0:
+        x = x + 1
+    return x.clamp(1, n)
+
+
+def apply_flip(states: torch.Tensor, k: int) -> torch.Tensor:
+    """Apply a prefix reversal of length ``k`` to every state in the batch."""
+
+    x = torch.as_tensor(states, dtype=torch.long)
+    if x.dim() == 1:
+        x = x.unsqueeze(0)
+    y = x.clone()
+    y[:, :k] = torch.flip(x[:, :k], dims=[1])
+    return y
+
+
+def pancake_neighbors(states: torch.Tensor, *, max_neighbors: int | None = None, mode: str = "all") -> torch.Tensor:
+    """Generate neighboring Pancake states by prefix flips.
+
+    The returned tensor has shape ``[batch, neighbors, n]``. Attention is later
+    applied between the encoded current state and encoded neighboring states,
+    not between positions inside one permutation.
+    """
+
+    x = normalize_permutations(states)
+    batch, n = x.shape
+    flips = torch.arange(2, n + 1, device=x.device)
+    if max_neighbors is not None and max_neighbors < len(flips):
+        if mode == "random":
+            idx = torch.randperm(len(flips), device=x.device)[:max_neighbors].sort().values
+        elif mode == "all":
+            idx = torch.linspace(0, len(flips) - 1, max_neighbors, device=x.device).round().long().unique()
+        else:
+            raise ValueError(f"Unknown neighbor mode: {mode}")
+        flips = flips[idx]
+    out = [apply_flip(x, int(k)) for k in flips.tolist()]
+    if not out:
+        return x.new_empty((batch, 0, n))
+    return torch.stack(out, dim=1)
+
+
+def gap_heuristic(states: torch.Tensor) -> torch.Tensor:
+    """Compute the classic Pancake GAP heuristic for data features/baselines."""
+
+    x = normalize_permutations(states)
+    n = x.shape[-1]
+    sentinel = torch.full((x.shape[0], 1), n + 1, dtype=x.dtype, device=x.device)
+    padded = torch.cat([x, sentinel], dim=1)
+    return (torch.abs(padded[:, 1:] - padded[:, :-1]) != 1).sum(dim=1).float()
+
+
+def exact_bfs_distances(n: int, *, max_states: int | None = None) -> tuple[torch.Tensor, torch.Tensor]:
+    """Enumerate exact distances from the identity by BFS for small ``n``."""
+
+    start = tuple(range(1, n + 1))
+    q: deque[tuple[int, ...]] = deque([start])
+    dist = {start: 0}
+    while q:
+        state = q.popleft()
+        d = dist[state]
+        for k in range(2, n + 1):
+            nxt = tuple(reversed(state[:k])) + state[k:]
+            if nxt in dist:
+                continue
+            dist[nxt] = d + 1
+            q.append(nxt)
+            if max_states is not None and len(dist) >= max_states:
+                q.clear()
+                break
+    states = torch.tensor(list(dist.keys()), dtype=torch.long)
+    y = torch.tensor([dist[tuple(s.tolist())] for s in states], dtype=torch.float32)
+    return states, y
+
+
+def save_tensor_dataset(path: str | Path, states: torch.Tensor, distances: torch.Tensor) -> None:
+    """Save states, scalar distance targets, and cached GAP features."""
+
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    torch.save(
+        {
+            "states": states.cpu().long(),
+            "distances": distances.cpu().float(),
+            "gap": gap_heuristic(states).cpu(),
+        },
+        path,
+    )
+
+
+@dataclass(frozen=True)
+class GenerationConfig:
+    n: int = 9
+    bfs_max_states: int | None = None
+    random_walk_width: int = 2048
+    random_walk_length: int = 32
+    nbt_history_depth: int = 20
+
+
+class PancakeTensorDataset(Dataset):
+    """Torch dataset for saved Pancake states and scalar targets."""
+
+    def __init__(self, path: str | Path) -> None:
+        payload = torch.load(path, map_location="cpu")
+        self.states = payload["states"].long()
+        self.distances = payload["distances"].float()
+        self.gap = payload.get("gap", gap_heuristic(self.states)).float()
+
+    def __len__(self) -> int:
+        return int(self.states.shape[0])
+
+    def __getitem__(self, idx: int) -> dict[str, torch.Tensor]:
+        return {"states": self.states[idx], "distance": self.distances[idx], "gap": self.gap[idx]}
+
+
+def cayleypy_pancake_graph(n: int, device: str | torch.device | None = None) -> Any:
+    """Build a CayleyPy Pancake Cayley graph using the public constructors."""
+
+    graph = cp.CayleyGraph(cp.PermutationGroups.pancake(n))
+    if device is not None and hasattr(graph, "to"):
+        graph = graph.to(device)
+    return graph
+
+
+def _random_walks_nbt(graph: Any, *, width: int, length: int, nbt_history_depth: int) -> tuple[torch.Tensor, torch.Tensor]:
+    """Call CayleyPy random_walks with non-backtracking mode."""
+
+    return graph.random_walks(mode="nbt", width=width, length=length, nbt_history_depth=nbt_history_depth)
+
+
+def generate_exact_bfs_dataset(path: str | Path, *, n: int = 9, max_states: int | None = None) -> None:
+    states, y = exact_bfs_distances(n, max_states=max_states)
+    save_tensor_dataset(path, states, y)
+
+
+def generate_cayleypy_nbt_dataset(
+    path: str | Path,
+    *,
+    n: int = 9,
+    width: int = 2048,
+    length: int = 32,
+    nbt_history_depth: int = 20,
+    device: str | torch.device | None = None,
+) -> None:
+    """Generate rollout-distance training data from CayleyPy random walks."""
+
+    graph = cayleypy_pancake_graph(n, device=device)
+    states, y = _random_walks_nbt(graph, width=width, length=length, nbt_history_depth=nbt_history_depth)
+    save_tensor_dataset(path, states.detach().cpu(), y.detach().cpu().float())
+
+
+def merge_datasets(paths: list[str | Path], output: str | Path) -> None:
+    """Merge shards and keep the smallest target for duplicate states."""
+
+    states, distances = [], []
+    for path in paths:
+        payload = torch.load(path, map_location="cpu")
+        states.append(payload["states"].long())
+        distances.append(payload["distances"].float())
+    x = torch.cat(states)
+    y = torch.cat(distances)
+    seen: dict[tuple[int, ...], int] = {}
+    for i, row in enumerate(x.tolist()):
+        key = tuple(int(v) for v in row)
+        prev = seen.get(key)
+        if prev is None or y[i] < y[prev]:
+            seen[key] = i
+    keep = sorted(seen.values())
+    save_tensor_dataset(output, x[keep], y[keep])
+
+
+@dataclass(frozen=True)
+class ModelConfig:
+    n: int
+    d_model: int = 128
+    depth: int = 3
+    dropout: float = 0.1
+    max_neighbors: int | None = 12
+    neighbor_mode: str = "all"
+    use_gap_feature: bool = False
+
+
+class StateEncoder(nn.Module):
+    """Permutation encoder used for current and neighboring states."""
+
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.token = nn.Embedding(config.n + 2, config.d_model)
+        self.position = nn.Embedding(config.n, config.d_model)
+        layers: list[nn.Module] = []
+        for _ in range(config.depth):
+            layers.extend(
+                [
+                    nn.LayerNorm(config.d_model),
+                    nn.Linear(config.d_model, config.d_model * 2),
+                    nn.GELU(),
+                    nn.Dropout(config.dropout),
+                    nn.Linear(config.d_model * 2, config.d_model),
+                ]
+            )
+        self.mlp = nn.Sequential(*layers)
+        self.out_norm = nn.LayerNorm(config.d_model)
+
+    def forward(self, states: torch.Tensor) -> torch.Tensor:
+        x = normalize_permutations(states, self.config.n).to(self.token.weight.device)
+        pos = torch.arange(x.shape[1], device=x.device)
+        h = self.token(x) + self.position(pos).unsqueeze(0)
+        z = h.mean(dim=1)
+        for i in range(0, len(self.mlp), 5):
+            z = z + self.mlp[i : i + 5](z)
+        return self.out_norm(z)
+
+
+class NeighborAttentionValueNet(nn.Module):
+    """Current-state/neighbor-attention scalar value network."""
+
+    def __init__(self, config: ModelConfig) -> None:
+        super().__init__()
+        self.config = config
+        self.encoder = StateEncoder(config)
+        self.attn = nn.MultiheadAttention(config.d_model, num_heads=4, dropout=config.dropout, batch_first=True)
+        value_in = config.d_model * 2 + (1 if config.use_gap_feature else 0)
+        self.value_head = nn.Sequential(
+            nn.LayerNorm(value_in),
+            nn.Linear(value_in, config.d_model),
+            nn.GELU(),
+            nn.Dropout(config.dropout),
+            nn.Linear(config.d_model, 1),
+            nn.Softplus(),
+        )
+
+    def forward(self, states: torch.Tensor, gap_feature: torch.Tensor | None = None) -> torch.Tensor:
+        x = normalize_permutations(states, self.config.n).to(next(self.parameters()).device)
+        current = self.encoder(x)
+        nbr = pancake_neighbors(x, max_neighbors=self.config.max_neighbors, mode=self.config.neighbor_mode)
+        batch, n_neighbors, n = nbr.shape
+        if n_neighbors == 0:
+            context = torch.zeros_like(current)
+        else:
+            nbr_emb = self.encoder(nbr.reshape(batch * n_neighbors, n)).reshape(batch, n_neighbors, -1)
+            context, _ = self.attn(current.unsqueeze(1), nbr_emb, nbr_emb, need_weights=False)
+            context = context.squeeze(1)
+        features = torch.cat([current, context], dim=-1)
+        if self.config.use_gap_feature:
+            if gap_feature is None:
+                raise ValueError("gap_feature is required when use_gap_feature=True")
+            features = torch.cat([features, gap_feature.to(features.device).float().view(-1, 1)], dim=-1)
+        return self.value_head(features).squeeze(-1)
+
+    @torch.inference_mode()
+    def heuristic(self, states: torch.Tensor, gap_feature: torch.Tensor | None = None, *, amp: bool = True) -> torch.Tensor:
+        device = next(self.parameters()).device
+        enabled = bool(amp and device.type == "cuda")
+        with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=enabled):
+            return self.forward(states.to(device), gap_feature=gap_feature).float()
+
+
+class NeuralPredictor(Predictor):
+    """CayleyPy Predictor backed by a callable student neural model.
+
+    CayleyPy accepts either a built-in heuristic name or a callable. This wrapper
+    passes the bound callable to ``Predictor`` rather than a non-existent string
+    such as ``"neural"``.
+    """
+
+    def __init__(
+        self,
+        graph: Any,
+        model: torch.nn.Module,
+        *,
+        batch_size: int = 4096,
+        device: str | torch.device | None = None,
+        amp: bool = True,
+        cache_size: int = 200_000,
+    ) -> None:
+        self.model = model.eval()
+        self.device = torch.device(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+        self.model.to(self.device)
+        self.batch_size = batch_size
+        self.amp = amp
+        self.cache_size = cache_size
+        self._cache: OrderedDict[tuple[int, ...], float] = OrderedDict()
+        super().__init__(graph, self._predict)
+
+    def _remember(self, key: tuple[int, ...], value: float) -> None:
+        self._cache[key] = value
+        self._cache.move_to_end(key)
+        if len(self._cache) > self.cache_size:
+            self._cache.popitem(last=False)
+
+    @torch.inference_mode()
+    def _predict(self, states: Any) -> torch.Tensor:
+        x = torch.as_tensor(states, dtype=torch.long)
+        if x.dim() == 1:
+            x = x.unsqueeze(0)
+        scores = torch.empty(x.shape[0], dtype=torch.float32, device=self.device)
+        missing_rows: list[int] = []
+        missing_keys: list[tuple[int, ...]] = []
+        x_cpu = x.detach().cpu()
+        for row, state in enumerate(x_cpu.tolist()):
+            key = tuple(int(v) for v in state)
+            cached = self._cache.get(key)
+            if cached is None:
+                missing_rows.append(row)
+                missing_keys.append(key)
+            else:
+                self._cache.move_to_end(key)
+                scores[row] = cached
+        if missing_rows:
+            missing = x[missing_rows].to(self.device, non_blocking=True)
+            chunks = []
+            for i in range(0, missing.shape[0], self.batch_size):
+                chunks.append(self.model.heuristic(missing[i : i + self.batch_size], amp=self.amp))
+            pred = torch.cat(chunks).float()
+            rows = torch.tensor(missing_rows, device=self.device)
+            scores[rows] = pred
+            for key, value in zip(missing_keys, pred.detach().cpu().tolist(), strict=True):
+                self._remember(key, float(value))
+        return scores
+
+    def __call__(self, states: Any) -> torch.Tensor:
+        return self._predict(states)
+
+
+@dataclass(frozen=True)
+class TrainConfig:
+    epochs: int = 20
+    batch_size: int = 512
+    lr: float = 3e-4
+    weight_decay: float = 1e-4
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    amp: bool = True
+    num_workers: int = 2
+
+
+def _grad_scaler(config: TrainConfig) -> torch.amp.GradScaler:
+    return torch.amp.GradScaler("cuda", enabled=config.amp and str(config.device).startswith("cuda"))
+
+
+def build_model(
+    config: ModelConfig,
+    checkpoint: str | Path | None = None,
+    device: str | torch.device | None = None,
+) -> NeighborAttentionValueNet:
+    model = NeighborAttentionValueNet(config)
+    if checkpoint is not None:
+        payload = torch.load(checkpoint, map_location="cpu")
+        model.load_state_dict(payload.get("model", payload))
+    return model.to(device or ("cuda" if torch.cuda.is_available() else "cpu"))
+
+
+def save_checkpoint(
+    path: str | Path,
+    model: NeighborAttentionValueNet,
+    model_config: ModelConfig,
+    train_config: TrainConfig | None = None,
+    *,
+    kind: str = "model",
+) -> None:
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload: dict[str, Any] = {"model": model.state_dict(), "model_config": asdict(model_config), "kind": kind}
+    if train_config is not None:
+        payload["train_config"] = asdict(train_config)
+    torch.save(payload, path)
+
+
+def load_checkpoint_config(checkpoint: str | Path) -> ModelConfig:
+    payload = torch.load(checkpoint, map_location="cpu")
+    return ModelConfig(**payload["model_config"])
+
+
+def train_teacher(dataset_path: str | Path, output: str | Path, model_config: ModelConfig, train_config: TrainConfig) -> None:
+    """Train a GAP-feature teacher on exact/rollout scalar distance targets."""
+
+    if not model_config.use_gap_feature:
+        raise ValueError("Teacher model_config must set use_gap_feature=True")
+    ds = PancakeTensorDataset(dataset_path)
+    loader = DataLoader(
+        ds,
+        batch_size=train_config.batch_size,
+        shuffle=True,
+        num_workers=train_config.num_workers,
+        pin_memory=str(train_config.device).startswith("cuda"),
+    )
+    model = build_model(model_config, device=train_config.device)
+    opt = torch.optim.AdamW(model.parameters(), lr=train_config.lr, weight_decay=train_config.weight_decay)
+    scaler = _grad_scaler(train_config)
+    for _ in range(train_config.epochs):
+        model.train()
+        pbar = tqdm(loader, desc="train-teacher")
+        for batch in pbar:
+            states = batch["states"].to(train_config.device, non_blocking=True)
+            distance = batch["distance"].to(train_config.device, non_blocking=True)
+            gap = batch["gap"].to(train_config.device, non_blocking=True)
+            opt.zero_grad(set_to_none=True)
+            with torch.autocast("cuda", dtype=torch.float16, enabled=scaler.is_enabled()):
+                pred = model(states, gap_feature=gap)
+                loss = F.smooth_l1_loss(pred, distance)
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
+            pbar.set_postfix(loss=float(loss.detach().cpu()))
+    save_checkpoint(output, model, model_config, train_config, kind="teacher")
+
+
+def distill_student(
+    dataset_path: str | Path,
+    teacher_checkpoint: str | Path,
+    output: str | Path,
+    student_config: ModelConfig,
+    train_config: TrainConfig,
+) -> None:
+    """Train a GAP-free student to match frozen teacher soft targets."""
+
+    if student_config.use_gap_feature:
+        raise ValueError("Student model_config must set use_gap_feature=False")
+    teacher_config = load_checkpoint_config(teacher_checkpoint)
+    if not teacher_config.use_gap_feature:
+        raise ValueError("Teacher checkpoint must use GAP feature")
+    teacher = build_model(teacher_config, checkpoint=teacher_checkpoint, device=train_config.device).eval()
+    for param in teacher.parameters():
+        param.requires_grad_(False)
+    student = build_model(student_config, device=train_config.device)
+    ds = PancakeTensorDataset(dataset_path)
+    loader = DataLoader(
+        ds,
+        batch_size=train_config.batch_size,
+        shuffle=True,
+        num_workers=train_config.num_workers,
+        pin_memory=str(train_config.device).startswith("cuda"),
+    )
+    opt = torch.optim.AdamW(student.parameters(), lr=train_config.lr, weight_decay=train_config.weight_decay)
+    scaler = _grad_scaler(train_config)
+    for _ in range(train_config.epochs):
+        student.train()
+        pbar = tqdm(loader, desc="distill-student")
+        for batch in pbar:
+            states = batch["states"].to(train_config.device, non_blocking=True)
+            gap = batch["gap"].to(train_config.device, non_blocking=True)
+            opt.zero_grad(set_to_none=True)
+            with torch.inference_mode(), torch.autocast("cuda", dtype=torch.float16, enabled=scaler.is_enabled()):
+                target = teacher(states, gap_feature=gap).detach().float()
+            with torch.autocast("cuda", dtype=torch.float16, enabled=scaler.is_enabled()):
+                pred = student(states)
+                loss = F.smooth_l1_loss(pred, target)
+            scaler.scale(loss).backward()
+            scaler.step(opt)
+            scaler.update()
+            pbar.set_postfix(loss=float(loss.detach().cpu()))
+    save_checkpoint(output, student, student_config, train_config, kind="student-distilled")
+
+
+def rl_finetune_student(
+    student_checkpoint: str | Path,
+    output: str | Path,
+    *,
+    n_values: Iterable[int] = (12, 15, 16, 20, 25, 30, 35, 40, 45, 50, 76, 100),
+    rollouts_per_n: int = 64,
+    scramble_steps: int = 40,
+    beam_width: int = 1024,
+    max_steps_extra: int = 5,
+    train_config: TrainConfig = TrainConfig(),
+) -> None:
+    """Fine-tune the GAP-free student from successful neural beam rollouts."""
+
+    cfg = load_checkpoint_config(student_checkpoint)
+    if cfg.use_gap_feature:
+        raise ValueError("RL fine-tuning requires a GAP-free student checkpoint")
+    model = build_model(cfg, checkpoint=student_checkpoint, device=train_config.device)
+    opt = torch.optim.AdamW(model.parameters(), lr=train_config.lr, weight_decay=train_config.weight_decay)
+    scaler = _grad_scaler(train_config)
+    for n in n_values:
+        if n > cfg.n:
+            raise ValueError(f"checkpoint supports n <= {cfg.n}, got n={n}")
+        graph = cayleypy_pancake_graph(n, device=train_config.device)
+        predictor = NeuralPredictor(
+            graph,
+            model,
+            batch_size=train_config.batch_size,
+            device=train_config.device,
+            amp=train_config.amp,
+        )
+        train_states: list[torch.Tensor] = []
+        train_targets: list[float] = []
+        for _ in tqdm(range(rollouts_per_n), desc=f"rl-student-n{n}"):
+            x, _ = _random_walks_nbt(graph, width=10, length=scramble_steps, nbt_history_depth=10)
+            start = x[-1]
+            res = graph.beam_search(
+                beam_width=beam_width,
+                max_steps=n + max_steps_extra,
+                start_state=start,
+                beam_mode="advanced",
+                predictor=predictor,
+            )
+            if res.path_found:
+                train_states.append(normalize_permutations(torch.as_tensor(start), n).cpu())
+                train_targets.append(float(res.path_length))
+        if not train_states:
+            continue
+        states = torch.vstack(train_states).to(train_config.device)
+        targets = torch.tensor(train_targets, device=train_config.device)
+        model.train()
+        opt.zero_grad(set_to_none=True)
+        with torch.autocast("cuda", dtype=torch.float16, enabled=scaler.is_enabled()):
+            pred = model(states)
+            loss = F.smooth_l1_loss(pred, targets)
+        scaler.scale(loss).backward()
+        scaler.step(opt)
+        scaler.update()
+    save_checkpoint(output, model, cfg, train_config, kind="student-rl")
+
+
+@dataclass(frozen=True)
+class EvalRecord:
+    n: int
+    heuristic: str
+    path_found: bool
+    path_length: int
+    runtime_s: float
+
+
+def load_student_predictor(checkpoint: str | Path, graph: Any, *, device: str | torch.device | None = None) -> NeuralPredictor:
+    config = load_checkpoint_config(checkpoint)
+    if config.use_gap_feature:
+        raise ValueError("Beam-search inference requires a GAP-free student checkpoint")
+    model = build_model(config, checkpoint=checkpoint, device=device)
+    return NeuralPredictor(graph, model, device=device)
+
+
+def evaluate_models(
+    starts: Iterable[torch.Tensor],
+    *,
+    n: int,
+    student_checkpoint: str | Path,
+    beam_width: int = 1024,
+    max_steps_extra: int = 5,
+    history_depth: int = 10,
+    device: str | torch.device | None = None,
+    include_gap_baseline: bool = True,
+) -> list[EvalRecord]:
+    """Evaluate student neural inference and optional external GAP baseline."""
+
+    graph = cayleypy_pancake_graph(n, device=device)
+    predictors: dict[str, Any] = {"student": load_student_predictor(student_checkpoint, graph, device=device)}
+    if include_gap_baseline:
+        predictors["gap"] = Predictor(graph, "gap")
+    records: list[EvalRecord] = []
+    for start in starts:
+        for name, predictor in predictors.items():
+            t0 = time.perf_counter()
+            res = graph.beam_search(
+                beam_width=beam_width,
+                max_steps=n + max_steps_extra,
+                start_state=start,
+                beam_mode="advanced",
+                history_depth=history_depth,
+                predictor=predictor,
+            )
+            records.append(EvalRecord(n, name, bool(res.path_found), int(res.path_length), time.perf_counter() - t0))
+    return records
+
+
+def summarize(records: list[EvalRecord]) -> dict[str, dict[str, float]]:
+    out: dict[str, dict[str, float]] = {}
+    for heuristic in sorted({r.heuristic for r in records}):
+        group = [r for r in records if r.heuristic == heuristic]
+        successes = [r for r in group if r.path_found]
+        out[heuristic] = {
+            "success_rate": len(successes) / max(1, len(group)),
+            "mean_path_length": sum(r.path_length for r in successes) / max(1, len(successes)),
+            "mean_runtime_s": sum(r.runtime_s for r in group) / max(1, len(group)),
+        }
+    return out
+
+
+def _sample_starts(graph: Any, samples: int, scramble_steps: int, history_depth: int) -> list[torch.Tensor]:
+    starts = []
+    for _ in range(samples):
+        x, _ = _random_walks_nbt(graph, width=8, length=scramble_steps, nbt_history_depth=history_depth)
+        starts.append(x[-1])
+    return starts
+
+
+@dataclass(frozen=True)
+class NotebookConfig:
+    """Notebook-friendly configuration for an end-to-end teacher/student run."""
+
+    n_pretrain: int = 8
+    max_model_n: int = 100
+    bfs_max_states: int | None = 20_000
+    include_cayleypy_nbt: bool = False
+    nbt_width: int = 512
+    nbt_length: int = 24
+    nbt_history_depth: int = 10
+    d_model: int = 128
+    depth: int = 3
+    dropout: float = 0.1
+    max_neighbors: int | None = 12
+    teacher_epochs: int = 10
+    distill_epochs: int = 10
+    batch_size: int = 256
+    lr: float = 3e-4
+    device: str = "cuda" if torch.cuda.is_available() else "cpu"
+    amp: bool = True
+    eval_n: int = 8
+    eval_samples: int = 4
+    eval_scramble_steps: int = 16
+    eval_beam_width: int = 1024
+    eval_history_depth: int = 10
+    work_dir: str = "notebook_outputs"
+
+
+def generate_notebook_dataset(config: NotebookConfig) -> Path:
+    """Generate BFS and optional CayleyPy-NBT data for notebook execution."""
+
+    work_dir = Path(config.work_dir)
+    work_dir.mkdir(parents=True, exist_ok=True)
+    shards: list[Path] = []
+    bfs_path = work_dir / f"pancake_n{config.n_pretrain}_bfs.pt"
+    generate_exact_bfs_dataset(bfs_path, n=config.n_pretrain, max_states=config.bfs_max_states)
+    shards.append(bfs_path)
+    if config.include_cayleypy_nbt:
+        nbt_path = work_dir / f"pancake_n{config.n_pretrain}_nbt.pt"
+        generate_cayleypy_nbt_dataset(
+            nbt_path,
+            n=config.n_pretrain,
+            width=config.nbt_width,
+            length=config.nbt_length,
+            nbt_history_depth=config.nbt_history_depth,
+            device=config.device,
+        )
+        shards.append(nbt_path)
+    merged_path = work_dir / f"pancake_n{config.n_pretrain}_pretrain.pt"
+    merge_datasets(shards, merged_path)
+    return merged_path
+
+
+def train_notebook_models(config: NotebookConfig, dataset_path: str | Path) -> tuple[NeighborAttentionValueNet, Path, Path]:
+    """Train a GAP-feature teacher and distill a GAP-free student."""
+
+    teacher_config = ModelConfig(
+        n=config.max_model_n,
+        d_model=config.d_model,
+        depth=config.depth,
+        dropout=config.dropout,
+        max_neighbors=config.max_neighbors,
+        use_gap_feature=True,
+    )
+    student_config = ModelConfig(
+        n=config.max_model_n,
+        d_model=config.d_model,
+        depth=config.depth,
+        dropout=config.dropout,
+        max_neighbors=config.max_neighbors,
+        use_gap_feature=False,
+    )
+    teacher_train = TrainConfig(
+        epochs=config.teacher_epochs,
+        batch_size=config.batch_size,
+        lr=config.lr,
+        device=config.device,
+        amp=config.amp,
+    )
+    distill_train = TrainConfig(
+        epochs=config.distill_epochs,
+        batch_size=config.batch_size,
+        lr=config.lr,
+        device=config.device,
+        amp=config.amp,
+    )
+    work_dir = Path(config.work_dir)
+    teacher_checkpoint = work_dir / "pancake_teacher_notebook.pt"
+    student_checkpoint = work_dir / "pancake_student_notebook.pt"
+    train_teacher(dataset_path, teacher_checkpoint, teacher_config, teacher_train)
+    distill_student(dataset_path, teacher_checkpoint, student_checkpoint, student_config, distill_train)
+    student = build_model(student_config, checkpoint=student_checkpoint, device=config.device)
+    return student, teacher_checkpoint, student_checkpoint
+
+
+def run_notebook_evaluation(config: NotebookConfig, student_checkpoint: str | Path) -> dict[str, dict[str, float]]:
+    """Compare external GAP baseline and student neural beam search."""
+
+    if config.eval_n > config.max_model_n:
+        raise ValueError(f"eval_n={config.eval_n} exceeds max_model_n={config.max_model_n}")
+    graph = cayleypy_pancake_graph(config.eval_n, device=config.device)
+    starts = _sample_starts(graph, config.eval_samples, config.eval_scramble_steps, config.eval_history_depth)
+    records = evaluate_models(
+        starts,
+        n=config.eval_n,
+        student_checkpoint=student_checkpoint,
+        beam_width=config.eval_beam_width,
+        history_depth=config.eval_history_depth,
+        device=config.device,
+        include_gap_baseline=True,
+    )
+    return summarize(records)
+
+
+def run_notebook_workflow(config: NotebookConfig = NotebookConfig()) -> dict[str, Any]:
+    """Run dataset generation, teacher training, student distillation, evaluation."""
+
+    dataset_path = generate_notebook_dataset(config)
+    student, teacher_checkpoint, student_checkpoint = train_notebook_models(config, dataset_path)
+    metrics = run_notebook_evaluation(config, student_checkpoint)
+    result = {
+        "dataset_path": str(dataset_path),
+        "teacher_checkpoint": str(teacher_checkpoint),
+        "student_checkpoint": str(student_checkpoint),
+        "metrics": metrics,
+        "student_model": student,
+    }
+    print({k: v for k, v in result.items() if k != "student_model"})
+    return result
